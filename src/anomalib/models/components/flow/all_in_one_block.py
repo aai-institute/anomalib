@@ -195,8 +195,8 @@ class AllInOneBlock(InvertibleModule):
         affine_coupling: bool = False,
         # TODO: (Note) Added parameters
         permute: bool = True,
-        bijective_affine_transform: bool = True,
-        reverse_bijective_affine_transform: bool = True
+        bijective_affine_transform: bool = False,
+        reverse_bijective_affine_transform: bool = False
     ) -> None:
         if dims_c is None:
             dims_c = []
@@ -306,8 +306,8 @@ class AllInOneBlock(InvertibleModule):
             self.L_mask = torch.tril(torch.ones(channels, channels), diagonal=-1)
             self.U_mask = torch.triu(torch.ones(channels, channels), diagonal=0)
 
-            self.L_raw.register_hook(lambda grad: grad * self.L_mask)
-            self.U_raw.register_hook(lambda grad: grad * self.U_mask)
+            self.L_raw.register_hook(lambda grad: grad * self.L_mask.to(grad.device))
+            self.U_raw.register_hook(lambda grad: grad * self.U_mask.to(grad.device))
             
             # Parameter initialization
             init.kaiming_uniform_(self.L_raw, nonlinearity="relu")
@@ -343,6 +343,11 @@ class AllInOneBlock(InvertibleModule):
         
         # Coupling type
         self.affine_coupling = affine_coupling
+    
+    def to(self, device):
+        super().to(device)
+        self.L_mask = self.L_mask.to(device)
+        self.R_mask = self.R_mask.to(device)
 
     def _construct_householder_permutation(self) -> torch.Tensor:
         """Compute permutation matrix from learned reflection vectors.
@@ -422,6 +427,11 @@ class AllInOneBlock(InvertibleModule):
         bias = self.LU_bias
         
         if rev:
+            bias = bias.view(
+                self.in_channels,
+                *([1] * self.input_rank)
+            )
+            
             return (
                 self.permute_function(x - bias, weight),
                 -LU_log_abs_det_jac
@@ -575,7 +585,7 @@ class AllInOneBlock(InvertibleModule):
         
         if self.bijective_affine_transform:
             if not rev or self.reverse_bijective_affine_transform:
-                x_out, scaling_jac = self._affine_transform(x_out[0], rev=False)
+                x_out, scaling_jac = self._affine_transform(x_out, rev=False)
                 global_scaling_jac += scaling_jac
 
         # add the global scaling Jacobian to the total.
