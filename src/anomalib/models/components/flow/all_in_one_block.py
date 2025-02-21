@@ -87,6 +87,7 @@ from scipy.stats import special_ortho_group
 from torch import nn
 from torch.nn import functional as F  # noqa: N812
 from torch.nn import init
+from torch.distributions.utils import lazy_property
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,8 @@ class AllInOneBlock(InvertibleModule):
         learned_householder_permutation: int = 0,
         reverse_permutation: bool = False,
         affine_coupling: bool = False,
+        # TODO: (Note) Added parameters
+        permute: bool = True,
         bijective_affine_transform: bool = True,
         reverse_bijective_affine_transform: bool = True
     ) -> None:
@@ -259,6 +262,7 @@ class AllInOneBlock(InvertibleModule):
         self.global_scale = nn.Parameter(torch.ones(1, self.in_channels, *([1] * self.input_rank)) * global_scale)
         self.global_offset = nn.Parameter(torch.zeros(1, self.in_channels, *([1] * self.input_rank)))
 
+        self.permute = permute
         if permute_soft:
             w = special_ortho_group.rvs(channels)
         else:
@@ -293,10 +297,8 @@ class AllInOneBlock(InvertibleModule):
         if use_LU:
             self.L_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
             self.U_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
-            self.bias = torch.nn.Parameter(torch.empty(channels)) 
+            self.LU_bias = torch.nn.Parameter(torch.empty(channels)) 
             self.prior_scale = 1.0 # TODO: configurable?
-
-            self.init_params()
 
             self.input_shape = channels
 
@@ -327,10 +329,10 @@ class AllInOneBlock(InvertibleModule):
                     sign * torch.normal(torch.zeros(d), scale).exp().diag()
                 self.U_raw.copy_(self.U_raw.triu())
 
-            if self.bias is not None:
+            if self.LU_bias is not None:
                 fan_in = channels
                 bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-                init.uniform_(self.bias, -bound, bound)
+                init.uniform_(self.LU_bias, -bound, bound)
             
 
         if subnet_constructor is None:
@@ -378,6 +380,60 @@ class AllInOneBlock(InvertibleModule):
             return ((self.permute_function(x, self.w_perm_inv) - self.global_offset) / scale, perm_log_jac)
 
         return (self.permute_function(x * scale + self.global_offset, self.w_perm), perm_log_jac)
+    
+
+    def L(self) -> torch.Tensor:
+        """The lower triangular matrix $\mathbf{L}$ of the layers LU decomposition"""
+        return self.L_raw.tril(-1)  + torch.eye(self.in_channels).to(self.L_raw.device)
+
+    def U(self) -> torch.Tensor:
+        """The upper triangular matrix $\mathbf{U}$ of the layers LU decomposition"""
+        return self.U_raw.triu()
+    
+    def _affine_transform(
+        self,
+        x: torch.Tensor,
+        rev: bool = False
+    ) ->  tuple[Any, float | torch.Tensor]:
+        """Perform the bijective affine transform.
+
+        Returns transformed outputs and the LogJacDet of the operation.
+
+        Args:
+            x (torch.Tensor): Input tensor
+            rev (bool, optional): Reverse transformation. Defaults to False.
+
+        Returns:
+            tuple[Any, float | torch.Tensor]: Transformed outputs and the LogJacDet of the transformation.
+        """
+        LU_log_abs_det_jac = torch.diag(self.U()).abs().log().sum()
+        if rev:
+            L_inv = torch.inverse(self.L())
+            U_inv = torch.inverse(self.U())
+            weight = torch.matmul(U_inv, L_inv)
+        else:
+            weight = torch.matmul(self.L(), self.U())
+            
+        weight = weight.view(
+            self.in_channels,
+            self.in_channels,
+            *([1] * self.input_rank)
+        )
+        bias = self.LU_bias
+        
+        if rev:
+            return (
+                self.permute_function(x - bias, weight),
+                -LU_log_abs_det_jac
+            )
+
+        return (
+            self.permute_function(x, weight, bias),
+            LU_log_abs_det_jac
+        )
+        
+        
+        
 
     def _pre_permute(self, x: torch.Tensor, rev: bool = False) -> torch.Tensor:
         """Permute before coupling block.
@@ -468,16 +524,29 @@ class AllInOneBlock(InvertibleModule):
         if c is None:
             c = []
 
-        if self.householder:
-            self.w_perm = self._construct_householder_permutation()
-            if rev or self.reverse_pre_permute:
-                self.w_perm_inv = self.w_perm.transpose(0, 1).contiguous()
+        global_scaling_jac = 0
+        if self.permute:
+            if self.householder:
+                self.w_perm = self._construct_householder_permutation()
+                if rev or self.reverse_pre_permute:
+                    self.w_perm_inv = self.w_perm.transpose(0, 1).contiguous()
 
-        if rev:
-            x, global_scaling_jac = self._permute(x[0], rev=True)
-            x = (x,)
-        elif self.reverse_pre_permute:
-            x = (self._pre_permute(x[0], rev=False),)
+            if rev:
+                x, scaling_jac = self._permute(x[0], rev=True)
+                global_scaling_jac += scaling_jac
+                
+                x = (x,)
+            elif self.reverse_pre_permute:
+                x = (self._pre_permute(x[0], rev=False),)
+        
+        if self.bijective_affine_transform:
+            if rev or self.reverse_bijective_affine_transform:
+                x, scaling_jac = self._affine_transform(x[0], rev=True)
+                global_scaling_jac += scaling_jac
+                x = (x,)
+
+                
+            
 
         x1, x2 = torch.split(x[0], self.splits, dim=1)
 
@@ -498,10 +567,16 @@ class AllInOneBlock(InvertibleModule):
         log_jac_det = j2
         x_out = torch.cat((x1, x2), 1)
 
-        if not rev:
-            x_out, global_scaling_jac = self._permute(x_out, rev=False)
-        elif self.reverse_pre_permute:
-            x_out = self._pre_permute(x_out, rev=True)
+        if self.permute:
+            if not rev:
+                x_out, global_scaling_jac = self._permute(x_out, rev=False)
+            elif self.reverse_pre_permute:
+                x_out = self._pre_permute(x_out, rev=True)
+        
+        if self.bijective_affine_transform:
+            if not rev or self.reverse_bijective_affine_transform:
+                x_out, scaling_jac = self._affine_transform(x_out[0], rev=False)
+                global_scaling_jac += scaling_jac
 
         # add the global scaling Jacobian to the total.
         # trick to get the total number of non-channel dimensions:
