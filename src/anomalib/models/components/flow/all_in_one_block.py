@@ -78,6 +78,7 @@ Raises:
 
 import logging
 from collections.abc import Callable
+import math
 from typing import Any
 
 import torch
@@ -85,6 +86,7 @@ from FrEIA.modules import InvertibleModule
 from scipy.stats import special_ortho_group
 from torch import nn
 from torch.nn import functional as F  # noqa: N812
+from torch.nn import init
 
 logger = logging.getLogger(__name__)
 
@@ -129,38 +131,52 @@ def _global_scale_exp_activation(input_tensor: torch.Tensor) -> torch.Tensor:
 class AllInOneBlock(InvertibleModule):
     r"""Module combining common operations in normalizing flows.
 
-    This block combines affine coupling, permutation, and global affine
-    transformation ('ActNorm'). It supports:
+    It combines affine or additive coupling, permutation, and global affine transformation
+    ('ActNorm'). It can also be used as GIN coupling block, perform learned
+    householder permutations, and use an inverted pre-permutation. The affine
+    transformation includes a soft clamping mechanism, first used in Real-NVP.
+    The block as a whole performs the following computation:
 
-    - GIN coupling blocks
-    - Learned householder permutations
-    - Inverted pre-permutation
-    - Soft clamping mechanism from Real-NVP
+    .. math::
+
+        y = V R \; \Psi(s_\mathrm{global}) \odot \mathrm{Coupling}\Big(R^{-1} V^{-1} x\Big)+ t_\mathrm{global}
+
+    - The inverse pre-permutation of x (i.e. :math:`R^{-1} V^{-1}`) is optional (see
+      ``reverse_permutation`` below).
+    - The learned householder reflection matrix
+      :math:`V` is also optional all together (see ``learned_householder_permutation``
+      below).
+    - For the coupling, the input is split into :math:`x_1, x_2` along
+      the channel dimension. Then the output of the coupling operation is the
+      two halves :math:`u = \mathrm{concat}(u_1, u_2)`.
+
+      .. math::
+
+          u_1 &= x_1 \odot \exp \Big( \alpha \; \mathrm{tanh}\big( s(x_2) \big)\Big) + t(x_2) \\
+          u_2 &= x_2
+
+      Because :math:`\mathrm{tanh}(s) \in [-1, 1]`, this clamping mechanism prevents
+      exploding values in the exponential. The hyperparameter :math:`\alpha` can be adjusted.
 
     Args:
-        dims_in (list[tuple[int]]): Dimensions of input tensor(s)
-        dims_c (list[tuple[int]], optional): Dimensions of conditioning
-            tensor(s). Defaults to None.
-        subnet_constructor (Callable, optional): Function that constructs the
-            subnet, called as ``f(channels_in, channels_out)``. Defaults to None.
-        affine_clamping (float, optional): Clamping value for affine coupling.
-            Defaults to 2.0.
-        gin_block (bool, optional): Use GIN coupling from Sorrenson et al, 2019.
-            Defaults to False.
-        global_affine_init (float, optional): Initial value for global affine
-            scaling. Defaults to 1.0.
-        global_affine_type (str, optional): Type of activation for global affine
-            scaling. One of ``'SIGMOID'``, ``'SOFTPLUS'``, ``'EXP'``.
-            Defaults to ``'SOFTPLUS'``.
-        permute_soft (bool, optional): Use soft permutation matrix from SO(N).
-            Defaults to False.
-        learned_householder_permutation (int, optional): Number of learned
-            householder reflections. Defaults to 0.
-        reverse_permutation (bool, optional): Apply inverse permutation before
-            block. Defaults to False.
-
-    Raises:
-        ValueError: If ``subnet_constructor`` is None or dimensions are invalid.
+        subnet_constructor: class or callable ``f``, called as ``f(channels_in, channels_out)`` and
+            should return a torch.nn.Module. Predicts coupling coefficients :math:`s, t`.
+        affine_clamping: clamp the output of the multiplicative coefficients before
+            exponentiation to +/- ``affine_clamping`` (see :math:`\alpha` above).
+        gin_block: Turn the block into a GIN block from Sorrenson et al, 2019.
+            Makes it so that the coupling operations as a whole is volume preserving.
+        global_affine_init: Initial value for the global affine scaling :math:`s_\mathrm{global}`.
+        global_affine_init: ``'SIGMOID'``, ``'SOFTPLUS'``, or ``'EXP'``. Defines the activation to be used
+            on the beta for the global affine scaling (:math:`\Psi` above).
+        permute_soft: bool, whether to sample the permutation matrix :math:`R` from :math:`SO(N)`,
+            or to use hard permutations instead. Note, ``permute_soft=True`` is very slow
+            when working with >512 dimensions.
+        learned_householder_permutation: Int, if >0, turn on the matrix :math:`V` above, that represents
+            multiple learned householder reflections. Slow if large number.
+            Dubious whether it actually helps network performance.
+        reverse_permutation: Reverse the permutation before the block, as introduced by Putzky
+            et al, 2019. Turns on the :math:`R^{-1} V^{-1}` pre-multiplication above.
+        affine_coupling: If True, use affine coupling layers, otherwise use additive coupling layers.
     """
 
     def __init__(
@@ -175,6 +191,9 @@ class AllInOneBlock(InvertibleModule):
         permute_soft: bool = False,
         learned_householder_permutation: int = 0,
         reverse_permutation: bool = False,
+        affine_coupling: bool = False,
+        bijective_affine_transform: bool = True,
+        reverse_bijective_affine_transform: bool = True
     ) -> None:
         if dims_c is None:
             dims_c = []
@@ -264,12 +283,64 @@ class AllInOneBlock(InvertibleModule):
                 torch.FloatTensor(w.T).view(channels, channels, *([1] * self.input_rank)),
                 requires_grad=False,
             )
+            
+        # LU transform
+        self.bijective_affine_transform = bijective_affine_transform
+        self.reverse_bijective_affine_transform = \
+            reverse_bijective_affine_transform
+        use_LU = \
+            bijective_affine_transform | reverse_bijective_affine_transform
+        if use_LU:
+            self.L_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
+            self.U_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
+            self.bias = torch.nn.Parameter(torch.empty(channels)) 
+            self.prior_scale = 1.0 # TODO: configurable?
+
+            self.init_params()
+
+            self.input_shape = channels
+
+            # Triangular matrices
+            self.L_mask = torch.tril(torch.ones(channels, channels), diagonal=-1)
+            self.U_mask = torch.triu(torch.ones(channels, channels), diagonal=0)
+
+            self.L_raw.register_hook(lambda grad: grad * self.L_mask)
+            self.U_raw.register_hook(lambda grad: grad * self.U_mask)
+            
+            # Parameter initialization
+            init.kaiming_uniform_(self.L_raw, nonlinearity="relu")
+            with torch.no_grad():
+                self.L_raw.copy_(self.L_raw.tril(diagonal=-1).fill_diagonal_(1))
+
+            init.kaiming_uniform_(self.U_raw, nonlinearity="relu")
+            
+            with torch.no_grad():
+                self.U_raw.fill_diagonal_(0) 
+                #self.U_raw += torch.eye(self.channel)
+                # TODO: Proper handling
+                d = channels
+                sign = -torch.ones(d) + 2 * torch.bernoulli(.5 * torch.ones(d))
+                scale = self.prior_scale * torch.ones(d) * 1/d \
+                    if self.prior_scale is not None else torch.ones(d) 
+                
+                self.U_raw += \
+                    sign * torch.normal(torch.zeros(d), scale).exp().diag()
+                self.U_raw.copy_(self.U_raw.triu())
+
+            if self.bias is not None:
+                fan_in = channels
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                init.uniform_(self.bias, -bound, bound)
+            
 
         if subnet_constructor is None:
             message = "Please supply a callable subnet_constructor function or object (see docstring)"
             raise ValueError(message)
         self.subnet = subnet_constructor(self.splits[0] + self.condition_channels, 2 * self.splits[1])
         self.last_jac = None
+        
+        # Coupling type
+        self.affine_coupling = affine_coupling
 
     def _construct_householder_permutation(self) -> torch.Tensor:
         """Compute permutation matrix from learned reflection vectors.
@@ -349,6 +420,29 @@ class AllInOneBlock(InvertibleModule):
             return (x * torch.exp(sub_jac) + a[:, ch:], torch.sum(sub_jac, dim=self.sum_dims))
 
         return ((x - a[:, ch:]) * torch.exp(-sub_jac), -torch.sum(sub_jac, dim=self.sum_dims))
+    
+    def _additive(
+        self,
+        x: torch.Tensor,
+        a: torch.Tensor,
+        rev: bool = False
+    ) -> tuple[Any, torch.Tensor]:
+        """Perform additive coupling operation.
+
+        Given the passive half, and the pre-activation outputs of the
+        coupling subnetwork, perform the addtive coupling operation.
+        Returns both the transformed inputs and the LogJacDet.
+        """
+        # the entire coupling coefficient tensor is scaled down by a
+        # factor of ten for stability and easier initialization.
+        a *= 0.1
+        ch = x.shape[1]
+
+        if not rev:
+            return (x + a[:, ch:], 0.)
+
+        return ((x - a[:, ch:]), 0.)
+        
 
     def forward(
         self,
@@ -389,12 +483,17 @@ class AllInOneBlock(InvertibleModule):
 
         x1c = torch.cat([x1, *c], 1) if self.conditional else x1
 
+        if self.affine_coupling:
+            coupling = self._affine
+        else:
+            coupling = self._additive
+            
         if not rev:
             a1 = self.subnet(x1c)
-            x2, j2 = self._affine(x2, a1)
+            x2, j2 = coupling(x2, a1)
         else:
             a1 = self.subnet(x1c)
-            x2, j2 = self._affine(x2, a1, rev=True)
+            x2, j2 = coupling(x2, a1, rev=True)
 
         log_jac_det = j2
         x_out = torch.cat((x1, x2), 1)
