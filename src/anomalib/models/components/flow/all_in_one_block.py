@@ -194,9 +194,9 @@ class AllInOneBlock(InvertibleModule):
         reverse_permutation: bool = False,
         affine_coupling: bool = False,
         # TODO: (Note) Added parameters
-        permute: bool = True,
-        bijective_affine_transform: bool = False,
-        reverse_bijective_affine_transform: bool = False
+        permute: bool = False,
+        bijective_affine_transform: bool = True,
+        reverse_bijective_affine_transform: bool = True
     ) -> None:
         if dims_c is None:
             dims_c = []
@@ -555,9 +555,6 @@ class AllInOneBlock(InvertibleModule):
                 global_scaling_jac += scaling_jac
                 x = (x,)
 
-                
-            
-
         x1, x2 = torch.split(x[0], self.splits, dim=1)
 
         x1c = torch.cat([x1, *c], 1) if self.conditional else x1
@@ -576,17 +573,17 @@ class AllInOneBlock(InvertibleModule):
 
         log_jac_det = j2
         x_out = torch.cat((x1, x2), 1)
+        
+        if self.bijective_affine_transform:
+            if not rev or self.reverse_bijective_affine_transform:
+                x_out, scaling_jac = self._affine_transform(x_out, rev=False)
+                global_scaling_jac += scaling_jac
 
         if self.permute:
             if not rev:
                 x_out, global_scaling_jac = self._permute(x_out, rev=False)
             elif self.reverse_pre_permute:
                 x_out = self._pre_permute(x_out, rev=True)
-        
-        if self.bijective_affine_transform:
-            if not rev or self.reverse_bijective_affine_transform:
-                x_out, scaling_jac = self._affine_transform(x_out, rev=False)
-                global_scaling_jac += scaling_jac
 
         # add the global scaling Jacobian to the total.
         # trick to get the total number of non-channel dimensions:
