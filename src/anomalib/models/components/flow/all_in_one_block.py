@@ -191,12 +191,14 @@ class AllInOneBlock(InvertibleModule):
         global_affine_type: str = "SOFTPLUS",
         permute_soft: bool = False,
         learned_householder_permutation: int = 0,
-        reverse_permutation: bool = False,
-        affine_coupling: bool = False,
+        reverse_permutation: bool = True,
         # TODO: (Note) Added parameters
-        permute: bool = False,
+        permute: bool = True,
+        use_prior: bool = False,
+        # Change the following to use a uniformly scaling flow
+        affine_coupling: bool = False,
         bijective_affine_transform: bool = True,
-        reverse_bijective_affine_transform: bool = True
+        reverse_bijective_affine_transform: bool = True,
     ) -> None:
         if dims_c is None:
             dims_c = []
@@ -292,9 +294,9 @@ class AllInOneBlock(InvertibleModule):
         self.bijective_affine_transform = bijective_affine_transform
         self.reverse_bijective_affine_transform = \
             reverse_bijective_affine_transform
-        use_LU = \
+        self.use_LU = \
             bijective_affine_transform | reverse_bijective_affine_transform
-        if use_LU:
+        if self.use_LU:
             self.L_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
             self.U_raw = torch.nn.Parameter(torch.empty(channels, channels)) 
             self.LU_bias = torch.nn.Parameter(torch.empty(channels)) 
@@ -306,9 +308,19 @@ class AllInOneBlock(InvertibleModule):
             self.L_mask = torch.tril(torch.ones(channels, channels), diagonal=-1)
             self.U_mask = torch.triu(torch.ones(channels, channels), diagonal=0)
 
+            # Hooks to zero out off-diagonal gradients
             self.L_raw.register_hook(lambda grad: grad * self.L_mask.to(grad.device))
-            self.U_raw.register_hook(lambda grad: grad * self.U_mask.to(grad.device))
-            
+            # Add gradient prior corrector
+            # (equivalent to adding a logprior term to the loss function)
+            if use_prior:
+                self.U_raw.register_hook(
+                    lambda grad: grad * self.U_mask.to(grad.device) + \
+                        self._logprior_grad_corrector()  
+                )
+            else:
+                self.U_raw.register_hook(
+                    lambda grad: grad * self.U_mask.to(grad.device) 
+                )
             # Parameter initialization
             init.kaiming_uniform_(self.L_raw, nonlinearity="relu")
             with torch.no_grad():
@@ -509,7 +521,58 @@ class AllInOneBlock(InvertibleModule):
 
         return ((x - a[:, ch:]), 0.)
         
+    def _logprior_grad_corrector(self):
+        """Computes the gradient corrector term based on a lognormal prior
+        on the diagonal of the U matrix of the LU transform"""
+        if not self.use_LU:
+            corrector = 0
+        else:
+            corrector = - 2*self.U_raw.diag().abs().log() / self.U_raw.diag() 
+            corrector += -1/self.U_raw.diag()
+            corrector = corrector.diag()
+            
+        return corrector  
+        
+    
+    def log_prior(self, correlated: bool = False) -> torch.Tensor:
+        """Returns the log prior of the model parameters. If LU layers are used,
+        we directly regularize the Jacobean determinant of the flow by putting an
+        independent mirrored log-normal
+        prior on the diagonal elements of $U$ matrices. The normal has
+        mean $0$ and standard deviation $\sqrt{d\cdot #layers}\sigma$, where $d$ is the data dimension.
+        That means that we put a log-normal prior on the determinant of the Jacobian.
 
+        Any additive constant is dropped in the optimization procedure.
+        """
+        if self.use_LU and self.prior_scale is not None:
+            log_prior = 0
+            for p in self.lu_layers:
+                precision = None
+                d = self.input_dim
+                if correlated:
+
+                    # Pairwise negative correlation of 1/d
+                    covariance = -1 / d * torch.ones(d, d).to(self.device) + (1 + 1 / d) * torch.diag(
+                        torch.ones(d).to(self.device)
+                    )
+                    # Scaling
+                    covariance = covariance * (self.prior_scale**2)
+                else:
+                    covariance = torch.eye(d).to(self.device)
+                    # Scaling
+                    covariance = covariance * (self.prior_scale**2)
+
+                precision = torch.linalg.inv(covariance).to(self.device)
+
+                # log-density of Normal in log-space
+                x = p.U.diag().abs().log() 
+                log_prior += -(x * (precision @ x)).sum()
+                # Change of variables to input space
+                log_prior += -x.sum()
+            return log_prior
+        else:
+            return 0
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -604,3 +667,5 @@ class AllInOneBlock(InvertibleModule):
             list[tuple[int]]: Output dimensions
         """
         return input_dims
+    
+    
