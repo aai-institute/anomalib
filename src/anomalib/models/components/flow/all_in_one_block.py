@@ -196,9 +196,9 @@ class AllInOneBlock(InvertibleModule):
         permute: bool = True,
         use_prior: bool = False,
         # Change the following to use a uniformly scaling flow
-        affine_coupling: bool = False,
-        bijective_affine_transform: bool = True,
-        reverse_bijective_affine_transform: bool = True,
+        affine_coupling: bool = True,
+        bijective_affine_transform: bool = False,
+        reverse_bijective_affine_transform: bool = False,
     ) -> None:
         if dims_c is None:
             dims_c = []
