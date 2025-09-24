@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 # General imports
 import numpy as np
@@ -15,6 +15,8 @@ import time
 
 
 # Anomalib imports
+# Import AllInOneBlock
+from anomalib.models.components.flow import AllInOneBlock 
 from anomalib.data import MVTec, Kolektor, BTech, Visa
 from anomalib.engine import Engine
 from anomalib.models import (
@@ -41,6 +43,7 @@ from anomalib.models import (
 from anomalib import metrics
 from anomalib.utils.post_processing import superimpose_anomaly_map
 from anomalib.data.datasets.image.visa import CATEGORIES
+from anomalib.data.datasets.image.mvtec import CATEGORIES as MVTec_CATEGORIES
 
 
 rows = 3
@@ -49,12 +52,13 @@ max_epochs = 100
 CATEGORIES = CATEGORIES
 
 # Make Sure that prefix relects the experimental setup, e.g. the used flow layer
-prefix = "ablation_visa"
+prefix = "ablation_mvtec"
 
 
 results = pd.DataFrame()
 for model_cls in tqdm(["UFlow", "FastFlow", "CFlow"], desc="Models"):
-    for cls in tqdm(CATEGORIES, desc="Classes", leave=False):
+    for cls in tqdm(MVTec_CATEGORIES, desc="Classes", leave=False):
+        
         models_types = {
             "UFlow": {
                 "class": Uflow,
@@ -102,9 +106,9 @@ for model_cls in tqdm(["UFlow", "FastFlow", "CFlow"], desc="Models"):
         print("+"*80)
         print(f"Training {model_cls} on class {cls}")
         print("+"*80)
-        dataset_root = Path.cwd() / "datasets" / "Visa"
+        dataset_root = Path.cwd() / "datasets" / "Mvtec"
         
-        datamodule = Visa(
+        datamodule = MVTec(
                 root = dataset_root,
                 category=cls,
                 train_batch_size=32,
@@ -126,7 +130,6 @@ for model_cls in tqdm(["UFlow", "FastFlow", "CFlow"], desc="Models"):
             #auto_lr_find=True,
             max_epochs=max_epochs
         )
-
         start_train = time.time()
         try:
             engine.fit(datamodule=datamodule, model=model)
